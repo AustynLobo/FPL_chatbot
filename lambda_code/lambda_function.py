@@ -11,6 +11,18 @@ TELEGRAM_TOKEN = os.environ["TELEGRAM_TOKEN"]
 ANTHROPIC_API_KEY = os.environ["ANTHROPIC_API_KEY"]
 TELEGRAM_API = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}"
 
+FPL_KEYWORDS = [
+    "player", "midfielder", "defender", "forward", "goalkeeper",
+    "captain", "transfer", "price", "fixture", "fdr", "points",
+    "gw", "gameweek", "buy", "sell", "bench", "squad", "team",
+    "best", "value", "cheap", "recommend", "who", "should", "vice captain", 
+    "triple captain", "team"
+]
+
+def is_fpl_related(message):
+    message_lower = message.lower()
+    return any(keyword in message_lower for keyword in FPL_KEYWORDS)
+
 
 def get_latest_predictions():
     s3 = boto3.client("s3")
@@ -136,6 +148,16 @@ def lambda_handler(event, context):
 
         # show typing indicator while processing
         send_typing_action(chat_id)
+
+        if not is_fpl_related(user_message):
+            send_telegram_message(
+                chat_id,
+                "I only answer FPL related questions! Try asking:\n"
+                "• Who should I captain this week?\n"
+                "• Best value midfielders?\n"
+                "• Which defenders have easy fixtures?"
+            )
+            return {"statusCode": 200, "body": "ok"}
 
         # get predictions and ask Claude
         predictions = get_latest_predictions()
