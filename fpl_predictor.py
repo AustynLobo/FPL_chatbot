@@ -353,10 +353,12 @@ team_gc = (
     .rename(columns={"score_ag": "goals_conceded_tgw"})
     .sort_values(["team","event"])
 )
+
 team_gc["opp_def_weakness"] = (
     team_gc.groupby("team")["goals_conceded_tgw"]
     .transform(lambda x: x.shift(1).rolling(5, min_periods=1).mean())
 )
+del grid_with_team 
 
 # map opponent weakness onto each fixture in predict_gw
 opp_weakness_rows = []
@@ -390,22 +392,24 @@ ROLL_STATS = [
 ]
 ROLL_STATS = [c for c in ROLL_STATS if c in grid.columns]
 
-for stat in ROLL_STATS:
-    grp = grid.groupby("player_id")[stat]
+def compute_rolling(grp):
+    out = {}
+    for stat in ROLL_STATS:
+        if stat not in grp.columns:
+            continue
+        s       = grp[stat]
+        shifted = s.shift(1)
+        out[f"{stat}_mean5"]  = shifted.rolling(5,  min_periods=1).mean()
+        out[f"{stat}_sum5"]   = shifted.rolling(5,  min_periods=1).sum()
+        out[f"{stat}_std5"]   = shifted.rolling(5,  min_periods=1).std().fillna(0)
+        out[f"{stat}_ewm"]    = shifted.ewm(span=5, min_periods=1).mean()
+        out[f"{stat}_mean19"] = shifted.rolling(19, min_periods=1).mean()
+        out[f"{stat}_trend"]  = out[f"{stat}_mean5"] - out[f"{stat}_mean19"]
+    return pd.DataFrame(out, index=grp.index)
 
-    # 5-GW rolling window
-    grid[f"{stat}_mean5"] = grp.transform(lambda x: x.shift(1).rolling(5,  min_periods=1).mean())
-    grid[f"{stat}_sum5"]  = grp.transform(lambda x: x.shift(1).rolling(5,  min_periods=1).sum())
-    grid[f"{stat}_std5"]  = grp.transform(lambda x: x.shift(1).rolling(5,  min_periods=1).std().fillna(0))
-
-    # EWA: all history, recent games weighted more heavily
-    grid[f"{stat}_ewm"]   = grp.transform(lambda x: x.shift(1).ewm(span=5, min_periods=1).mean())
-
-    # Long-term baseline (19 GWs ≈ half a season)
-    grid[f"{stat}_mean19"] = grp.transform(lambda x: x.shift(1).rolling(19, min_periods=1).mean())
-
-    # Trend: positive = improving, negative = declining
-    grid[f"{stat}_trend"]  = grid[f"{stat}_mean5"] - grid[f"{stat}_mean19"]
+rolled = grid.groupby("player_id", group_keys=False).apply(compute_rolling)
+grid   = pd.concat([grid, rolled], axis=1)
+grid["pts_trend"] = grid["total_points_mean5"] - grid["total_points_mean19"]
 
 # Overall points trend
 grid["pts_trend"] = grid["total_points_mean5"] - grid["total_points_mean19"]
@@ -579,7 +583,7 @@ for pos, pos_label in POS_LABELS.items():
     # Overprediction fixes: max_depth=3, min_child_weight=10
     m = XGBRegressor(
         n_estimators=800, learning_rate=0.03, max_depth=3,
-        subsample=0.8, colsample_bytree=0.8, min_child_weight=10,
+        subsample=0.8, colsample_bytree=0.8, min_child_weight=10, n_jobs =2,
         objective="reg:squarederror", random_state=42, verbosity=0
     )
 
