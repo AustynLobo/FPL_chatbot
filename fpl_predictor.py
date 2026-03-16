@@ -358,7 +358,7 @@ team_gc["opp_def_weakness"] = (
     team_gc.groupby("team")["goals_conceded_tgw"]
     .transform(lambda x: x.shift(1).rolling(5, min_periods=1).mean())
 )
-del grid_with_team 
+del grid_with_team
 
 # map opponent weakness onto each fixture in predict_gw
 opp_weakness_rows = []
