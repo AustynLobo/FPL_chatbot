@@ -37,6 +37,7 @@ Requirements:
 
 import argparse
 import glob
+from io import BytesIO
 import json
 import os
 import warnings
@@ -47,6 +48,7 @@ import matplotlib
 import matplotlib.pyplot as plt
 import matplotlib.patches as mpatches
 import matplotlib.patheffects as pe
+import boto3
 
 warnings.filterwarnings("ignore")
 
@@ -101,6 +103,8 @@ parser.add_argument("--gw",        type=int,   default=None,  help="Gameweek num
 parser.add_argument("--formation", default=None,              help="Force formation e.g. 4-3-3")
 parser.add_argument("--budget",    type=float, default=100.0, help="Budget in £m (default: 100)")
 parser.add_argument("--save",      action="store_true",       help="Save PNG instead of showing")
+parser.add_argument("--export",    action="store_true",       help="Export the visualization to S3")
+parser.add_argument("--s3-bucket", type=str,                  help="Name of the S3 bucket for export")
 args = parser.parse_args()
 
 if args.formation and args.formation not in FORMATIONS:
@@ -613,14 +617,51 @@ ax_pitch.text(
     zorder=10
 )
 
+def upload_to_s3(fig, bucket_name, mode, filename):
+    """Uploads the matplotlib figure to S3 with organizational pathing."""
+    try:
+        s3 = boto3.client('s3')
+        
+        # Determine the folder structure based on mode
+        # 'actual' -> totw/actual/ | 'predict' -> totw/predict/
+        folder_prefix = "totw/actual" if mode == "actual" else "totw/predict"
+        s3_path = f"{folder_prefix}/{filename}"
+        
+        # Save figure to a buffer
+        img_data = BytesIO()
+        fig.savefig(img_data, format='png', dpi=150, 
+                    bbox_inches="tight", facecolor=fig.get_facecolor())
+        img_data.seek(0)
+        
+        print(f"  Uploading to s3://{bucket_name}/{s3_path}...")
+        s3.put_object(
+            Bucket=bucket_name,
+            Key=s3_path,
+            Body=img_data,
+            ContentType='image/png'
+        )
+        print("  Upload successful!")
+    except Exception as e:
+        print(f"  S3 Upload failed: {e}")
+
 # ─────────────────────────────────────────────────────────────────────────────
-# 5. Save or show
+# 5. Save, Show, or Export
 # ─────────────────────────────────────────────────────────────────────────────
+filename = f"fpl_totw_{file_suffix}_gw{gw_num}.png"
+
+if args.export:
+    if not args.s3_bucket:
+        print("  Error: --s3-bucket is required when using --export")
+    else:
+        # Pass the mode to the helper for folder routing
+        upload_to_s3(fig, args.s3_bucket, args.mode, filename)
+
 if args.save:
-    out_path = os.path.join(PRED_DIR, f"fpl_totw_{file_suffix}_gw{gw_num}.png")
+    out_path = os.path.join(PRED_DIR, filename)
     plt.savefig(out_path, dpi=150, bbox_inches="tight",
                 facecolor=fig.get_facecolor())
-    print(f"\n  Saved -> {out_path}")
-else:
+    print(f"\n  Saved locally -> {out_path}")
+
+if not args.save and not args.export:
     print("\nShowing team — close the window to exit.")
     plt.show()
