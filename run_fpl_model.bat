@@ -13,11 +13,11 @@ python fpl_predictor.py --export --s3-bucket my-fpl-predictions >> logs\task_sch
 echo [%date% %time%] fpl_predictor.py exit code: %ERRORLEVEL% >> logs\task_scheduler.log 2>&1
 
 echo [%date% %time%] Running TOTW actual >> logs\task_scheduler.log 2>&1
-python fpl_team_of_the_week.py --mode actual --save >> logs\task_scheduler.log 2>&1
+python fpl_team_of_the_week.py --mode actual --save --export --s3-bucket my-fpl-predictions>> logs\task_scheduler.log 2>&1
 echo [%date% %time%] TOTW actual exit code: %ERRORLEVEL% >> logs\task_scheduler.log 2>&1
 
 echo [%date% %time%] Running TOTW predict >> logs\task_scheduler.log 2>&1
-python fpl_team_of_the_week.py --mode predict --save >> logs\task_scheduler.log 2>&1
+python fpl_team_of_the_week.py --mode predict --save --export --s3-bucket my-fpl-predictions >> logs\task_scheduler.log 2>&1
 echo [%date% %time%] TOTW predict exit code: %ERRORLEVEL% >> logs\task_scheduler.log 2>&1
 
 echo [%date% %time%] Uploading charts to S3 >> logs\task_scheduler.log 2>&1
