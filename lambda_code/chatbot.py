@@ -1,152 +1,52 @@
+"""
+lambda_function.py
+==================
+AWS Lambda entry point. Thin router only — no business logic lives here.
+
+Request routing order:
+  1. /start command         → reset history + welcome message
+  2. TOTW image request     → presigned S3 URL + Telegram sendPhoto
+  3. FPL text question      → Claude API + Telegram sendMessage
+  4. Non-FPL message        → polite rejection
+
+All logic lives in the helper modules:
+  telegram_helper.py     — Telegram send functions
+  history_helper.py      — DynamoDB conversation history
+  predictions_helper.py  — S3 predictions CSV + Claude API
+  totw_helper.py         — TOTW detection + S3 presigned URL + photo send
+"""
+
 import json
-import boto3
-import csv
-import io
-import urllib.request
-import urllib.parse
-import os
-import boto3
+import logging
+import urllib.error
 
-dynamodb = boto3.resource("dynamodb")
-table    = dynamodb.Table(os.environ["DYNAMODB_TABLE"])
+from telegram_helper    import send_message, send_typing_action
+from history_helper     import get_history, save_history, clear_history
+from predictions_helper import is_fpl_related, get_latest_predictions, ask_claude
+from totw_helper        import is_totw_request, handle_totw_request
 
-MAX_HISTORY = 10  # keep last 10 messages per user
+logger = logging.getLogger()
+logger.setLevel(logging.INFO)
 
-S3_BUCKET = os.environ["S3_BUCKET"]
-TELEGRAM_TOKEN = os.environ["TELEGRAM_TOKEN"]
-ANTHROPIC_API_KEY = os.environ["ANTHROPIC_API_KEY"]
-TELEGRAM_API = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}"
+WELCOME_MESSAGE = (
+    "👋 Welcome to the *FPL Predictor Bot*!\n\n"
+    "Ask me anything about this gameweek:\n"
+    "• Who are the best value midfielders?\n"
+    "• Which defenders have easy fixtures?\n"
+    "• Who should I captain this week?\n\n"
+    "📊 *Team of the Week:*\n"
+    "• Show me the actual TOTW\n"
+    "• Show me the predicted TOTW"
+)
 
-FPL_KEYWORDS = [
-    "player", "midfielder", "defender", "forward", "goalkeeper",
-    "captain", "transfer", "price", "fixture", "fdr", "points",
-    "gw", "gameweek", "buy", "sell", "bench", "squad", "team",
-    "best", "value", "cheap", "recommend", "who", "should", "vice captain", 
-    "triple captain", "team"
-]
-
-def get_history(chat_id):
-    try:
-        response = table.get_item(Key={"chat_id": str(chat_id)})
-        return response.get("Item", {}).get("messages", [])
-    except Exception:
-        return []
-
-
-def save_history(chat_id, messages):
-    try:
-        # keep only last MAX_HISTORY messages to avoid token limits
-        messages = messages[-MAX_HISTORY:]
-        table.put_item(Item={
-            "chat_id"  : str(chat_id),
-            "messages" : messages
-        })
-    except Exception:
-        pass
-
-def is_fpl_related(message):
-    message_lower = message.lower()
-    return any(keyword in message_lower for keyword in FPL_KEYWORDS)
-
-
-def get_latest_predictions():
-    s3 = boto3.client("s3")
-    
-    response = s3.list_objects_v2(
-        Bucket=S3_BUCKET,
-        Prefix="predictions/fpl_best_by_position_"
-    )
-    files = [obj["Key"] for obj in response.get("Contents", [])]
-    latest = sorted(files)[-1]
-    
-    obj = s3.get_object(Bucket=S3_BUCKET, Key=latest)
-    content = obj["Body"].read().decode("utf-8")
-    
-    reader = csv.DictReader(io.StringIO(content))
-    rows = list(reader)
-    
-    lines = []
-    current_pos = None
-    for row in rows:
-        if row["Pos"] != current_pos:
-            current_pos = row["Pos"]
-            lines.append(f"\n{current_pos}:")
-        lines.append(
-            f"  {row['Player']:<20} Price: £{row['Price(£m)']}  "
-            f"PredPts: {row['PredPts']}  FDR: {row['FDR']}  "
-            f"Home: {row['Home']}  Value: {row['Value']}"
-        )
-    
-    gw = latest.split("gw")[1].replace(".csv", "")
-    return f"GW{gw} Predictions:\n" + "\n".join(lines)
-
-
-def ask_claude(user_message, predictions_context, history):
-    # build message list from history + current message
-    messages = history + [
-        {
-            "role": "user",
-            "content": f"FPL data:\n{predictions_context}\n\nQuestion: {user_message}"
-        }
-    ]
-
-    payload = json.dumps({
-        "model": "claude-haiku-4-5-20251001",
-        "max_tokens": 1024,
-        "system": (
-            "You are an FPL (Fantasy Premier League) assistant. "
-            "Answer questions using the prediction data provided. "
-            "Be concise and helpful. Always mention player prices "
-            "and predicted points when recommending players. "
-            "Keep responses under 200 words as this is a Telegram chat."
-        ),
-        "messages": messages
-    }).encode()
-
-    req = urllib.request.Request(
-        "https://api.anthropic.com/v1/messages",
-        data=payload,
-        headers={
-            "Content-Type": "application/json",
-            "x-api-key": os.environ["ANTHROPIC_API_KEY"],
-            "anthropic-version": "2023-06-01"
-        }
-    )
-
-    with urllib.request.urlopen(req, timeout=30) as response:
-        result = json.loads(response.read())
-        return result["content"][0]["text"]
-
-
-def send_telegram_message(chat_id, text):
-    payload = json.dumps({
-        "chat_id": chat_id,
-        "text": text,
-        "parse_mode": "Markdown"
-    }).encode()
-
-    req = urllib.request.Request(
-        f"{TELEGRAM_API}/sendMessage",
-        data=payload,
-        headers={"Content-Type": "application/json"}
-    )
-
-    with urllib.request.urlopen(req, timeout=10) as response:
-        return json.loads(response.read())
-
-
-def send_typing_action(chat_id):
-    payload = json.dumps({
-        "chat_id": chat_id,
-        "action": "typing"
-    }).encode()
-
-    req = urllib.request.Request(
-        f"{TELEGRAM_API}/sendChatAction",
-        data=payload,
-        headers={"Content-Type": "application/json"}
-    )
-    urllib.request.urlopen(req, timeout=5)
+NOT_FPL_MESSAGE = (
+    "I only answer FPL related questions! Try asking:\n"
+    "• Who should I captain this week?\n"
+    "• Best value midfielders?\n"
+    "• Which defenders have easy fixtures?\n"
+    "• Show me the actual TOTW\n"
+    "• Show me the predicted TOTW"
+)
 
 
 def lambda_handler(event, context):
@@ -156,60 +56,51 @@ def lambda_handler(event, context):
         chat_id      = message.get("chat", {}).get("id")
         user_message = message.get("text", "")
 
+        logger.info(f"Incoming Event: {json.dumps(event)}")
+
         if not chat_id or not user_message:
             return {"statusCode": 200, "body": "ok"}
 
+        # ── 1. /start ─────────────────────────────────────────────────────────
         if user_message == "/start":
-            # clear history on /start so conversation resets
-            save_history(chat_id, [])
-            send_telegram_message(
-                chat_id,
-                "👋 Welcome to the *FPL Predictor Bot*!\n\n"
-                "Ask me anything about this gameweek:\n"
-                "• Who are the best value midfielders?\n"
-                "• Which defenders have easy fixtures?\n"
-                "• Who should I captain this week?"
-            )
+            clear_history(chat_id)
+            send_message(chat_id, WELCOME_MESSAGE)
             return {"statusCode": 200, "body": "ok"}
 
+        # ── 2. TOTW image request ─────────────────────────────────────────────
+        if is_totw_request(user_message):
+            send_typing_action(chat_id)
+            handle_totw_request(chat_id, user_message)
+            return {"statusCode": 200, "body": "ok"}
+
+        # ── 3. Non-FPL message ────────────────────────────────────────────────
         if not is_fpl_related(user_message):
-            send_telegram_message(
-                chat_id,
-                "I only answer FPL related questions! Try asking:\n"
-                "• Who should I captain this week?\n"
-                "• Best value midfielders?\n"
-                "• Which defenders have easy fixtures?"
-            )
+            send_message(chat_id, NOT_FPL_MESSAGE)
             return {"statusCode": 200, "body": "ok"}
 
+        # ── 4. FPL text question → Claude ─────────────────────────────────────
         send_typing_action(chat_id)
 
-        # load conversation history
-        history = get_history(chat_id)
-
-        # get predictions and ask Claude with full history
+        history     = get_history(chat_id)
         predictions = get_latest_predictions()
         answer      = ask_claude(user_message, predictions, history)
 
-        # update history with this exchange
         history.append({"role": "user",      "content": user_message})
         history.append({"role": "assistant", "content": answer})
         save_history(chat_id, history)
 
-        send_telegram_message(chat_id, answer)
-
+        send_message(chat_id, answer)
         return {"statusCode": 200, "body": "ok"}
 
     except urllib.error.HTTPError as e:
         error_body = e.read().decode()
+        logger.error(f"HTTP error: {e.code} — {error_body}")
         return {
             "statusCode": 500,
-            "body": json.dumps({
-                "error"  : f"HTTP {e.code}",
-                "detail" : error_body
-            })
+            "body": json.dumps({"error": f"HTTP {e.code}", "detail": error_body})
         }
     except Exception as e:
+        logger.error(f"Unhandled exception: {e}")
         return {
             "statusCode": 500,
             "body": json.dumps({"error": str(e)})
