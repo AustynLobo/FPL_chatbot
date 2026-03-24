@@ -6,19 +6,6 @@ Data sources (all live from FPL API):
   fixtures       : /api/fixtures/
   player history : /api/element-summary/{id}/  ← exact per-GW points + minutes
 
-Key improvements over previous version:
-  1. Exact FPL points from element-summary API (no reconstruction from fixture stats)
-  2. Exact minutes per GW (fixes availability score accuracy)
-  3. Separate XGBoost model per position (GK / DEF / MID / FWD)
-  4. Position-specific features (e.g. clean sheets for GK/DEF, goals for FWD)
-  5. Best players ranked per position in output
-  6. Injury/availability intelligence using chance_of_playing_next_round + status
-  7. Transfer momentum feature (crowd wisdom signal)
-  8. Data-driven opponent defensive strength (replaces human-rated FDR)
-  9. Double gameweek multiplier per position
-  10. Price change signal output
-  11. Overprediction fixes: target clipping, min_child_weight, max_depth, prediction cap
-
 Usage:
     python fpl_predictor.py [--predict-gw 31] [--debug "Salah"] [--force-refresh]
     python fpl_predictor.py --export --s3-bucket my-fpl-predictions
@@ -42,6 +29,7 @@ import numpy as np
 import pandas as pd
 from xgboost import XGBRegressor
 from sklearn.metrics import mean_absolute_error
+from update_meta import get_and_sync_fpl_metadata
 
 warnings.filterwarnings("ignore")
 os.makedirs("data", exist_ok=True)
@@ -141,16 +129,46 @@ def cache_valid():
         return False, None
 
 
-def save_cache(bs, fx, hist_df, gw):
+import boto3 # Make sure this is imported at the top of your script
+
+def save_cache(bs, fx, hist_df, gw, bucket_name=None):
+    # 1. Existing local saves
     with open(CACHE_BOOTSTRAP, "w") as f:
         json.dump(bs, f)
     with open(CACHE_FIXTURES, "w") as f:
         json.dump(fx, f)
     hist_df.to_parquet(CACHE_HISTORY, index=False)
-    with open(CACHE_META, "w") as f:
-        json.dump({"last_finished_gw": int(gw)}, f)
-    print(f"  Cache saved for GW {gw}")
 
+    # 2. Logic to find the NEXT Gameweek and Deadline
+    next_gw_id = int(gw) + 1
+    next_gw_data = next((event for event in bs['events'] if event['id'] == next_gw_id), None)
+    
+    meta_content = {
+        "last_finished_gw": int(gw),
+        "next_gw": next_gw_id,
+        "next_deadline_unix": next_gw_data['deadline_time_epoch'] if next_gw_data else None,
+        "deadline_human": next_gw_data['deadline_time'] if next_gw_data else "Unknown"
+    }
+
+    # 3. Save meta.json LOCALLY
+    with open(CACHE_META, "w") as f:
+        json.dump(meta_content, f, indent=4)
+    
+    # 4. Upload meta.json to S3 (The "Megaphone" for your Lambda)
+    if bucket_name:
+        try:
+            s3 = boto3.client('s3')
+            s3.put_object(
+                Bucket=bucket_name,
+                Key='cache/meta.json',
+                Body=json.dumps(meta_content),
+                ContentType='application/json'
+            )
+            print(f"  S3 Meta updated for GW {next_gw_id}")
+        except Exception as e:
+            print(f"  ⚠️ S3 Meta upload failed: {e}")
+
+    print(f"  Cache saved for GW {gw} (Next Deadline: {meta_content['deadline_human']})")
 # ─────────────────────────────────────────────────────────────────────────────
 # 1. Load bootstrap + fixtures  (from cache or FPL API)
 # ─────────────────────────────────────────────────────────────────────────────
@@ -1023,11 +1041,15 @@ if args.export:
             bs_obj = json.load(f)
         with open(CACHE_FIXTURES) as f:
             fx_obj = json.load(f)
+
         upload_json_to_s3(bs_obj,  "cache/bootstrap.json",           bucket)
         upload_json_to_s3(fx_obj,  "cache/fixtures.json",            bucket)
         upload_df_to_s3(history,   "cache/player_history.parquet",   bucket, fmt="parquet")
-        upload_json_to_s3({"last_finished_gw": int(last_finished_gw)},
-                          "cache/meta.json", bucket)
+
+        metadata = get_and_sync_fpl_metadata(bucket)
+        if metadata:
+            print(f"Fetched Metadata for GW{metadata['next_gw']}")
+            upload_json_to_s3(metadata, "cache/meta.json", bucket)
 
         print(f"\n✅  All files uploaded to s3://{bucket}")
         print(f"   Lambda chatbot reads: predictions/fpl_best_by_position_{gw_tag}.csv")
