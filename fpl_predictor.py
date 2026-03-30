@@ -441,6 +441,173 @@ for xg_col in ["expected_goals", "expected_assists", "expected_goal_involvements
             lambda x: x.shift(1)
         )
 
+def compute_team_strengths(grid, fixtures, finished_gws, n_gws=10):
+    """
+    Aggregates player-level rolling stats into team attack / defence ratings.
+    Uses last n_gws finished gameweeks only (recent form window).
+    
+    Returns a dict: team_id -> {att, def, xg, xgc, home_boost}
+    """
+    recent_gws = finished_gws[-n_gws:]
+    recent     = grid[grid["event"].isin(recent_gws)].copy()
+
+    # Need team on the grid rows — merge if not present
+    if "team" not in recent.columns:
+        recent = recent.merge(
+            players[["id", "team"]].rename(columns={"id": "player_id"}),
+            on="player_id", how="left"
+        )
+
+    # Per team per GW: sum goals scored, goals conceded, xG, xGC, minutes
+    team_gw = (
+        recent.groupby(["team", "event"])
+        .agg(
+            goals_scored      = ("goals_scored",           "sum"),
+            goals_conceded    = ("goals_conceded",         "sum"),
+            xg                = ("expected_goals",         "sum"),
+            xgc               = ("expected_goals_conceded","sum"),
+            minutes           = ("minutes",                "sum"),
+            is_home           = ("is_home",                "mean"),  # 1=home, 0=away
+        )
+        .reset_index()
+    )
+
+    # Normalise goals conceded — the raw sum double-counts (all defenders
+    # on the same team share the same goals_conceded value from the API).
+    # Divide by the number of players who played to get the true team figure.
+    player_counts = (
+        recent[recent["minutes"] > 0]
+        .groupby(["team", "event"])
+        .size()
+        .reset_index(name="n_players")
+    )
+    team_gw = team_gw.merge(player_counts, on=["team", "event"], how="left")
+    team_gw["n_players"]    = team_gw["n_players"].fillna(1).clip(lower=1)
+    team_gw["goals_conceded_true"] = (
+        team_gw["goals_conceded"] / team_gw["n_players"]
+    ).round()
+    team_gw["xgc_true"] = team_gw["xgc"] / team_gw["n_players"]
+
+    # Average across GWs to get season rating per team
+    team_ratings = (
+        team_gw.groupby("team")
+        .agg(
+            att_goals  = ("goals_scored",       "mean"),
+            def_goals  = ("goals_conceded_true","mean"),
+            att_xg     = ("xg",                 "mean"),
+            def_xgc    = ("xgc_true",           "mean"),
+            home_ratio = ("is_home",             "mean"),  # fraction of games at home
+        )
+        .reset_index()
+    )
+
+    # Home advantage boost — teams score ~30% more at home historically
+    HOME_BOOST = 1.30
+    AWAY_BOOST = 0.85
+
+    # Blend goals and xG 50/50 for a more stable estimate
+    team_ratings["att"] = (
+        0.5 * team_ratings["att_goals"] + 0.5 * team_ratings["att_xg"]
+    )
+    team_ratings["deff"] = (
+        0.5 * team_ratings["def_goals"] + 0.5 * team_ratings["def_xgc"]
+    )
+
+    return team_ratings.set_index("team").to_dict("index")
+
+def simulate_match(home_team_id, away_team_id, team_strengths,
+                     n_simulations=50_000):
+    """
+    Improved simulation:
+    - Adds correlated goals (reduces unrealistic clean sheets)
+    - Returns winner probabilities + clean sheet probabilities
+    - Keeps Poisson framework (fast + interpretable)
+    """
+
+    league_avg_home = 1.53
+    league_avg_away = 1.15
+
+    HOME_BOOST = 1.30
+    AWAY_BOOST = 0.85
+
+    home = team_strengths.get(home_team_id, {})
+    away = team_strengths.get(away_team_id, {})
+
+    # --- Attack strength ---
+    home_att = (home.get("att", league_avg_home) / league_avg_home) * HOME_BOOST
+    away_att = (away.get("att", league_avg_away) / league_avg_away) * AWAY_BOOST
+
+    # --- FIXED Defence normalization ---
+    home_def = home.get("deff", league_avg_home) / league_avg_home
+    away_def = away.get("deff", league_avg_away) / league_avg_away
+
+    # --- Expected goals ---
+    lambda_home = home_att * away_def * league_avg_home
+    lambda_away = away_att * home_def * league_avg_away
+
+    lambda_home = float(np.clip(lambda_home, 0.4, 4.5))
+    lambda_away = float(np.clip(lambda_away, 0.4, 4.5))
+
+    rng = np.random.default_rng(42)
+
+    # Shared random intensity → makes games more "open"
+    shared_lambda = 0.25
+    shared_goals = rng.poisson(shared_lambda, n_simulations)
+
+    home_goals = rng.poisson(lambda_home, n_simulations) + shared_goals
+    away_goals = rng.poisson(lambda_away, n_simulations) + shared_goals
+
+    # --- Outcomes ---
+    home_wins = (home_goals > away_goals)
+    draws     = (home_goals == away_goals)
+    away_wins = (away_goals > home_goals)
+
+    home_win_prob = home_wins.mean()
+    draw_prob     = draws.mean()
+    away_win_prob = away_wins.mean()
+
+    # --- Winner (what you actually care about) ---
+    probs = {
+        "home": home_win_prob,
+        "draw": draw_prob,
+        "away": away_win_prob
+    }
+    winner = max(probs, key=probs.get)
+    confidence = probs[winner]
+
+    # --- Clean sheet probabilities ---
+    clean_sheet_home = (away_goals == 0).mean()
+    clean_sheet_away = (home_goals == 0).mean()
+
+    # --- Optional: top scorelines (still useful, but secondary) ---
+    score_counts = {}
+    for h, a in zip(home_goals, away_goals):
+        key = (int(h), int(a))
+        score_counts[key] = score_counts.get(key, 0) + 1
+
+    top_scores = sorted(score_counts.items(), key=lambda x: -x[1])[:5]
+    top_scores_prob = [
+        {"score": f"{h}-{a}", "prob": round(cnt / n_simulations, 4)}
+        for (h, a), cnt in top_scores
+    ]
+
+    return {
+        "winner": winner,
+        "win_confidence": round(confidence, 4),
+
+        "home_win_prob": round(home_win_prob, 4),
+        "draw_prob": round(draw_prob, 4),
+        "away_win_prob": round(away_win_prob, 4),
+
+        "expected_home_goals": round(lambda_home, 2),
+        "expected_away_goals": round(lambda_away, 2),
+
+        "clean_sheet_home_prob": round(clean_sheet_home, 4),
+        "clean_sheet_away_prob": round(clean_sheet_away, 4),
+
+        "top_scorelines": top_scores_prob,
+    }
+
 # ─────────────────────────────────────────────────────────────────────────────
 # 7. Merge player metadata + transfer momentum + position-specific features
 # ─────────────────────────────────────────────────────────────────────────────
@@ -862,6 +1029,86 @@ def price_change_signal(row):
         return "→ Stable"
 
 pred_df["price_signal"] = pred_df.apply(price_change_signal, axis=1)
+
+# ─────────────────────────────────────────────────────────────────────────────
+# 14c. Match result and score predictions
+# ─────────────────────────────────────────────────────────────────────────────
+print("\nPredicting match results and scorelines...")
+
+
+team_strengths  = compute_team_strengths(grid, fixtures, finished_gws_sorted)
+gw_fixtures_up  = fixtures[fixtures["event"] == predict_gw].copy()
+
+# Build team name lookup
+team_name_lookup = dict(zip(teams_df["id"], teams_df["name"]))
+team_short_lookup = dict(zip(
+    teams_df["id"],
+    teams_df["short_name"] if "short_name" in teams_df.columns else teams_df["name"]
+))
+
+match_predictions = []
+
+for _, fix in gw_fixtures_up.iterrows():
+    home_id   = int(fix["team_h"])
+    away_id   = int(fix["team_a"])
+    home_name = team_short_lookup.get(home_id, f"Team{home_id}")
+    away_name = team_short_lookup.get(away_id, f"Team{away_id}")
+
+    result = simulate_match(home_id, away_id, team_strengths)
+
+    match_predictions.append({
+        "Home": home_name,
+        "Away": away_name,
+
+        # --- Core outcome ---
+        "Winner": result["winner"],
+        "WinConf%": round(result["win_confidence"] * 100, 1),
+
+        # --- Probabilities ---
+        "HomeWin%": round(result["home_win_prob"] * 100, 1),
+        "Draw%":    round(result["draw_prob"] * 100, 1),
+        "AwayWin%": round(result["away_win_prob"] * 100, 1),
+
+        # --- Expected goals ---
+        "xG_Home": result["expected_home_goals"],
+        "xG_Away": result["expected_away_goals"],
+
+        # --- ✅ Clean sheet insight ---
+        "CS_Home%": round(result["clean_sheet_home_prob"] * 100, 1),
+        "CS_Away%": round(result["clean_sheet_away_prob"] * 100, 1),
+
+        # --- Optional scorelines ---
+        "TopScorelines": " | ".join(
+            f"{s['score']}({s['prob']*100:.1f}%)"
+            for s in result["top_scorelines"][:5]
+        ),
+    })
+match_pred_df = pd.DataFrame(match_predictions)
+print(f"\n{'='*100}")
+print(f"  MATCH PREDICTIONS — GW {predict_gw}")
+print(f"{'='*100}")
+
+print(
+    f"  {'Home':<14} {'Away':<14} {'Winner':<8} {'Conf':>6}  "
+    f"{'Home%':>6} {'Draw%':>6} {'Away%':>6}  "
+    f"{'CS_H':>6} {'CS_A':>6}  {'xG':>9}"
+)
+
+print(
+    f"  {'─'*14} {'─'*14} {'─'*8} {'─'*6}  "
+    f"{'─'*6} {'─'*6} {'─'*6}  "
+    f"{'─'*6} {'─'*6}  {'─'*9}"
+)
+
+for _, row in match_pred_df.iterrows():
+    print(
+        f"  {row['Home']:<14} {row['Away']:<14} "
+        f"{row['Winner']:<8} {row['WinConf%']:>5.1f}%  "
+        f"{row['HomeWin%']:>5.1f}% {row['Draw%']:>5.1f}% {row['AwayWin%']:>5.1f}%  "
+        f"{row['CS_Home%']:>5.1f}% {row['CS_Away%']:>5.1f}%  "
+        f"{row['xG_Home']:.2f}-{row['xG_Away']:.2f}"
+    )
+
 
 # ─────────────────────────────────────────────────────────────────────────────
 # 15. Debug trace
